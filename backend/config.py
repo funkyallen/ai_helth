@@ -3,7 +3,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -70,6 +70,17 @@ class Settings(BaseSettings):
     sos_broadcast_window_seconds: int = 15
     health_score_floor: int = 35
     stream_retention_points: int = 600
+
+    @field_validator("debug", mode="before")
+    @classmethod
+    def normalize_debug_flag(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"release", "prod", "production", "off", "false", "0", "no"}:
+                return False
+            if normalized in {"debug", "dev", "development", "on", "true", "1", "yes"}:
+                return True
+        return value
 
     @property
     def data_dir(self) -> Path:

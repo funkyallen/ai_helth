@@ -10,6 +10,7 @@ from backend.config import get_settings
 from backend.models.device_model import DeviceRecord
 from backend.models.health_model import HealthSample, IngestResponse
 from backend.services.alarm_service import AlarmService
+from backend.services.care_service import CareService
 from backend.services.device_service import DeviceService
 from backend.services.stream_service import StreamService
 from backend.services.websocket_manager import WebSocketManager
@@ -37,6 +38,7 @@ _parser = T10PacketParser(sos_window_seconds=_settings.sos_broadcast_window_seco
 _analysis_service = HealthDataAnalysisService()
 _rag_service = LangChainRAGService(_settings, _settings.data_dir.parent / "docs" / "knowledge-base")
 _agent_service = HealthAgentService(_settings, _rag_service, _analysis_service)
+_care_service = CareService(_device_service)
 
 _device_service.seed_devices(_data_generator.build_devices())
 
@@ -71,6 +73,10 @@ def get_parser() -> T10PacketParser:
 
 def get_agent_service() -> HealthAgentService:
     return _agent_service
+
+
+def get_care_service() -> CareService:
+    return _care_service
 
 
 def get_data_analysis_service() -> HealthDataAnalysisService:
