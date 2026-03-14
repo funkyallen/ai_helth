@@ -1,9 +1,8 @@
 ﻿from __future__ import annotations
 
-from pathlib import Path
-
-from agent.agent_service import HealthAgentService
-from agent.rag_service import RAGService
+from agent.analysis_service import HealthDataAnalysisService
+from agent.langchain_rag_service import LangChainRAGService
+from agent.langgraph_health_agent import HealthAgentService
 from ai.anomaly_detector import CommunityHealthClusterer, IntelligentAnomalyScorer, RealtimeAnomalyDetector
 from ai.data_generator import SyntheticHealthDataGenerator
 from ai.health_score_model import BaselineTracker, HealthScoreService
@@ -35,8 +34,9 @@ _data_generator = SyntheticHealthDataGenerator(
     mac_prefix=_settings.allowed_mac_prefixes[0],
 )
 _parser = T10PacketParser(sos_window_seconds=_settings.sos_broadcast_window_seconds)
-_rag_service = RAGService(Path("docs") / "knowledge-base")
-_agent_service = HealthAgentService(_settings, _rag_service)
+_analysis_service = HealthDataAnalysisService()
+_rag_service = LangChainRAGService(_settings, _settings.data_dir.parent / "docs" / "knowledge-base")
+_agent_service = HealthAgentService(_settings, _rag_service, _analysis_service)
 
 _device_service.seed_devices(_data_generator.build_devices())
 
@@ -71,6 +71,10 @@ def get_parser() -> T10PacketParser:
 
 def get_agent_service() -> HealthAgentService:
     return _agent_service
+
+
+def get_data_analysis_service() -> HealthDataAnalysisService:
+    return _analysis_service
 
 
 def get_intelligent_scorer() -> IntelligentAnomalyScorer:

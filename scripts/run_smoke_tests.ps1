@@ -1,8 +1,6 @@
 param(
     [string]$CondaEnv = 'helth',
-    [string]$ListenHost = '127.0.0.1',
-    [int]$Port = 8000,
-    [switch]$Reload
+    [switch]$BuildFrontend
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,12 +28,31 @@ function Resolve-EnvPython {
     throw "Cannot find python.exe for conda env '$CondaEnv'."
 }
 
-$args = @('-m', 'uvicorn', 'backend.main:app', '--host', $ListenHost, '--port', "$Port")
-if ($Reload) {
-    Write-Warning 'The project lives in OneDrive. Use --reload only when you really need hot reloading.'
-    $args += '--reload'
-}
+$tests = @(
+    'tests\test_parser.py',
+    'tests\test_alarm_service.py',
+    'tests\test_agent_analysis.py',
+    'tests\test_health_api.py',
+    'tests\test_chat_api.py'
+)
 
 $python = Resolve-EnvPython -CondaEnv $CondaEnv
-& $python @args
-exit $LASTEXITCODE
+$cacheDir = Join-Path $env:TEMP 'ai_health_pytest_cache'
+& $python -m pytest -o cache_dir=$cacheDir @tests
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
+if ($BuildFrontend) {
+    Push-Location 'frontend\vue-dashboard'
+    try {
+        if (-not (Test-Path 'node_modules')) {
+            npm.cmd install
+        }
+        npm.cmd run build
+        exit $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+    }
+}

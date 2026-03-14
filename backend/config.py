@@ -39,9 +39,24 @@ class Settings(BaseSettings):
     qwen_api_base: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     qwen_api_key: str = ""
     qwen_model: str = "qwen-plus"
+    qwen_embedding_model: str = "text-embedding-v3"
+    qwen_rerank_model: str = "qwen-reranker-v1"
+    qwen_rerank_api: str = "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
+    qwen_enable_rerank: bool = True
+
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:1.7b"
+
     llm_timeout_seconds: int = 10
+    rag_timeout_seconds: int = 15
+    rag_top_k: int = 3
+    rag_fetch_k: int = 8
+    rag_chunk_size: int = 700
+    rag_chunk_overlap: int = 150
+
+    network_probe_url: str = "https://dashscope.aliyuncs.com"
+    network_probe_timeout_seconds: int = 3
+    network_probe_cache_seconds: int = 20
 
     jwt_secret: str = "replace-me-in-production"
     ws_heartbeat_seconds: int = 30

@@ -1,6 +1,7 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import re
 from dataclasses import dataclass
@@ -10,18 +11,6 @@ from urllib import error, request
 
 from backend.config import Settings
 
-try:
-    from langchain_community.vectorstores import Chroma
-    from langchain_core.embeddings import Embeddings
-
-    _LANGCHAIN_RAG_AVAILABLE = True
-except Exception:  # pragma: no cover - fallback when optional deps are missing
-    Chroma = None
-    _LANGCHAIN_RAG_AVAILABLE = False
-
-    class Embeddings:  # type: ignore[no-redef]
-        """Local placeholder for optional langchain dependency."""
-
 
 @dataclass
 class RetrievalCandidate:
@@ -30,8 +19,8 @@ class RetrievalCandidate:
     score: float
 
 
-class QwenAPIEmbeddings(Embeddings):
-    """Embedding client backed by Qwen-compatible API."""
+class DashScopeEmbeddings:
+    """Embedding client backed by DashScope's OpenAI-compatible embedding API."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -49,7 +38,7 @@ class QwenAPIEmbeddings(Embeddings):
     def embed_query(self, text: str) -> list[float]:
         vectors = self._embed([text])
         if not vectors:
-            raise RuntimeError("Qwen embedding API returned no vectors")
+            raise RuntimeError("DashScope embedding API returned no vectors")
         return vectors[0]
 
     def _embed(self, texts: list[str]) -> list[list[float]]:
@@ -73,7 +62,7 @@ class QwenAPIEmbeddings(Embeddings):
             with request.urlopen(req, timeout=self._settings.rag_timeout_seconds) as response:
                 body = json.loads(response.read().decode("utf-8"))
         except (error.URLError, error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
-            raise RuntimeError("Qwen embedding API call failed") from exc
+            raise RuntimeError("DashScope embedding API call failed") from exc
 
         data = body.get("data", [])
         if not isinstance(data, list):
@@ -86,8 +75,8 @@ class QwenAPIEmbeddings(Embeddings):
         return vectors
 
 
-class RAGService:
-    """RAG service with vector retrieval + optional rerank and local fallback."""
+class LangChainRAGService:
+    """RAG service with native ChromaDB retrieval plus offline keyword fallback."""
 
     def __init__(self, settings: Settings, knowledge_dir: Path) -> None:
         self._settings = settings
@@ -96,8 +85,10 @@ class RAGService:
         self._documents = self._load_documents()
         self._chunks = self._build_chunks(self._documents)
         self._docs_hash = self._build_docs_hash(self._chunks)
-        self._embedding_client = QwenAPIEmbeddings(settings)
-        self._vectorstore = None
+        self._embedding_client = DashScopeEmbeddings(settings)
+        self._chromadb = None
+        self._client = None
+        self._collection = None
 
     def search(
         self,
@@ -130,38 +121,34 @@ class RAGService:
         return [self._format_candidate(item) for item in candidates[:limit]]
 
     def _vector_retrieve(self, query: str, top_k: int) -> list[RetrievalCandidate]:
-        if not self._ensure_vectorstore():
+        if not self._ensure_vectorstore() or self._collection is None:
             return []
 
         try:
-            docs = self._vectorstore.similarity_search_with_relevance_scores(query, k=top_k)
-            ranked = [
-                RetrievalCandidate(
-                    source=doc.metadata.get("source", "knowledge-base"),
-                    text=doc.page_content,
-                    score=float(score),
-                )
-                for doc, score in docs
-            ]
-            ranked.sort(key=lambda item: item.score, reverse=True)
-            return ranked
-        except Exception:
-            pass
-
-        try:
-            docs = self._vectorstore.similarity_search_with_score(query, k=top_k)
-            ranked = [
-                RetrievalCandidate(
-                    source=doc.metadata.get("source", "knowledge-base"),
-                    text=doc.page_content,
-                    score=1.0 / (1.0 + float(distance)),
-                )
-                for doc, distance in docs
-            ]
-            ranked.sort(key=lambda item: item.score, reverse=True)
-            return ranked
+            query_embedding = self._embedding_client.embed_query(query)
+            results = self._collection.query(
+                query_embeddings=[query_embedding],
+                n_results=top_k,
+                include=["documents", "metadatas", "distances"],
+            )
         except Exception:
             return []
+
+        documents = (results.get("documents") or [[]])[0]
+        metadatas = (results.get("metadatas") or [[]])[0]
+        distances = (results.get("distances") or [[]])[0]
+        ranked: list[RetrievalCandidate] = []
+        for text, metadata, distance in zip(documents, metadatas, distances):
+            ranked.append(
+                RetrievalCandidate(
+                    source=str((metadata or {}).get("source", "knowledge-base")),
+                    text=str(text),
+                    score=1.0 / (1.0 + float(distance or 0.0)),
+                )
+            )
+
+        ranked.sort(key=lambda item: item.score, reverse=True)
+        return ranked
 
     def _keyword_retrieve(self, query: str, top_k: int) -> list[RetrievalCandidate]:
         query_tokens = set(self._tokenize(query))
@@ -192,7 +179,7 @@ class RAGService:
         return scored[:top_k]
 
     def _rerank(self, query: str, candidates: list[RetrievalCandidate], top_k: int) -> list[RetrievalCandidate]:
-        if not candidates or not self._settings.qwen_rerank_api:
+        if not candidates or not self._settings.qwen_rerank_api or not self._settings.qwen_api_key:
             return []
 
         payload = json.dumps(
@@ -253,44 +240,52 @@ class RAGService:
             return body["data"]
         return []
 
+    def _load_chromadb(self):
+        if self._chromadb is False:
+            return None
+        if self._chromadb is not None:
+            return self._chromadb
+        try:
+            self._chromadb = importlib.import_module("chromadb")
+        except Exception:
+            self._chromadb = False
+            return None
+        return self._chromadb
+
     def _ensure_vectorstore(self) -> bool:
-        if self._vectorstore is not None:
+        if self._collection is not None:
             return True
-        if not _LANGCHAIN_RAG_AVAILABLE or Chroma is None:
-            return False
-        if not self._chunks:
+
+        chromadb_module = self._load_chromadb()
+        if chromadb_module is None or not self._chunks:
             return False
 
         collection_name = f"health_kb_{self._docs_hash[:16]}"
         try:
-            store = Chroma(
-                collection_name=collection_name,
-                persist_directory=self._settings.chroma_path,
-                embedding_function=self._embedding_client,
+            self._client = chromadb_module.PersistentClient(path=self._settings.chroma_path)
+            self._collection = self._client.get_or_create_collection(
+                name=collection_name,
+                metadata={"docs_hash": self._docs_hash},
             )
-            existing_count = 0
-            collection = getattr(store, "_collection", None)
-            if collection is not None and hasattr(collection, "count"):
-                existing_count = int(collection.count())
-
-            if existing_count == 0:
+            if self._collection.count() == 0:
                 texts = [chunk["text"] for chunk in self._chunks]
-                metadatas = [
-                    {"source": chunk["source"], "chunk_id": chunk["chunk_id"]}
-                    for chunk in self._chunks
-                ]
-                store.add_texts(texts=texts, metadatas=metadatas)
-                persist = getattr(store, "persist", None)
-                if callable(persist):
-                    persist()
-
-            self._vectorstore = store
+                embeddings = self._embedding_client.embed_documents(texts)
+                self._collection.add(
+                    ids=[chunk["chunk_id"] for chunk in self._chunks],
+                    documents=texts,
+                    metadatas=[{"source": chunk["source"], "chunk_id": chunk["chunk_id"]} for chunk in self._chunks],
+                    embeddings=embeddings,
+                )
             return True
         except Exception:
-            self._vectorstore = None
+            self._client = None
+            self._collection = None
             return False
 
     def _load_documents(self) -> list[tuple[str, str]]:
+        if not self._knowledge_dir.exists():
+            return []
+
         documents: list[tuple[str, str]] = []
         for path in sorted(self._knowledge_dir.glob("*.md")):
             content = path.read_text(encoding="utf-8").strip()

@@ -1,7 +1,9 @@
 ﻿from __future__ import annotations
 
 import json
+import time
 from statistics import mean
+from typing import Any, TypedDict
 from urllib import error, request
 
 from agent.prompt_templates import build_prompt
@@ -10,13 +12,50 @@ from backend.config import Settings
 from backend.models.health_model import HealthSample
 from backend.models.user_model import UserRole
 
+try:
+    from langchain_community.chat_models import ChatOllama
+    from langchain_core.messages import HumanMessage
+    from langgraph.graph import END, START, StateGraph
+
+    _LANGGRAPH_AVAILABLE = True
+except Exception:  # pragma: no cover - optional runtime dependency
+    ChatOllama = None
+    HumanMessage = None
+    END = None
+    START = None
+    StateGraph = None
+    _LANGGRAPH_AVAILABLE = False
+
+try:
+    from langchain_community.chat_models import ChatOpenAI
+except Exception:  # pragma: no cover - optional runtime dependency
+    ChatOpenAI = None
+
+
+class AgentState(TypedDict, total=False):
+    role: UserRole
+    question: str
+    samples: list[HealthSample]
+    route_mode: str
+    network_online: bool
+    selected_mode: str
+    health_context: str
+    knowledge_hits: list[str]
+    prompt: str
+    answer: str
+
 
 class HealthAgentService:
-    """Unified agent entry for Qwen cloud mode and Ollama local mode."""
+    """LangGraph-based health agent with Qwen cloud + Ollama local routing."""
 
     def __init__(self, settings: Settings, rag_service: RAGService) -> None:
         self._settings = settings
         self._rag = rag_service
+        self._cloud_llm = None
+        self._local_llm = None
+        self._network_cache_at = 0.0
+        self._network_cache_value = False
+        self._graph = self._build_graph() if _LANGGRAPH_AVAILABLE else None
 
     def analyze(
         self,
@@ -24,25 +63,119 @@ class HealthAgentService:
         role: UserRole,
         question: str,
         samples: list[HealthSample],
-        mode: str = "local",
-    ) -> dict[str, str | list[str]]:
-        health_context = self._build_health_context(samples)
-        knowledge_hits = self._rag.search(question, top_k=3)
-        prompt = build_prompt(role, question, health_context, "\n\n".join(knowledge_hits))
+        mode: str = "auto",
+    ) -> dict[str, str | bool | list[str]]:
+        route_mode = mode if mode in {"auto", "local", "cloud"} else "auto"
+        initial_state: AgentState = {
+            "role": role,
+            "question": question,
+            "samples": samples,
+            "route_mode": route_mode,
+        }
 
-        if mode == "cloud":
-            answer = self._call_qwen(prompt)
+        if self._graph is not None:
+            result = self._graph.invoke(initial_state)
         else:
-            answer = self._call_ollama(prompt)
+            result = self._run_fallback_pipeline(initial_state)
+
+        answer = str(result.get("answer", "")).strip()
+        selected_mode = str(result.get("selected_mode", "local"))
+        knowledge_hits = list(result.get("knowledge_hits", []))
+        network_online = bool(result.get("network_online", False))
 
         if not answer:
             answer = self._fallback_answer(samples, role)
 
         return {
-            "mode": mode,
+            "mode": selected_mode,
+            "network_online": network_online,
             "answer": answer,
             "references": knowledge_hits,
         }
+
+    def _build_graph(self):
+        graph = StateGraph(AgentState)
+        graph.add_node("route", self._route_node)
+        graph.add_node("retrieve", self._retrieve_node)
+        graph.add_node("prompt", self._prompt_node)
+        graph.add_node("generate", self._llm_node)
+
+        graph.add_edge(START, "route")
+        graph.add_edge("route", "retrieve")
+        graph.add_edge("retrieve", "prompt")
+        graph.add_edge("prompt", "generate")
+        graph.add_edge("generate", END)
+        return graph.compile()
+
+    def _run_fallback_pipeline(self, initial_state: AgentState) -> AgentState:
+        state: AgentState = dict(initial_state)
+        state.update(self._route_node(state))
+        state.update(self._retrieve_node(state))
+        state.update(self._prompt_node(state))
+        state.update(self._llm_node(state))
+        return state
+
+    def _route_node(self, state: AgentState) -> AgentState:
+        network_online = self._network_available()
+        requested = str(state.get("route_mode", "auto"))
+
+        if requested == "local":
+            selected_mode = "local"
+        elif requested == "cloud":
+            selected_mode = "cloud" if network_online and bool(self._settings.qwen_api_key) else "local"
+        else:
+            selected_mode = "cloud" if network_online and bool(self._settings.qwen_api_key) else "local"
+
+        return {
+            "network_online": network_online,
+            "selected_mode": selected_mode,
+        }
+
+    def _retrieve_node(self, state: AgentState) -> AgentState:
+        question = str(state.get("question", ""))
+        network_online = bool(state.get("network_online", False))
+        hits = self._rag.search(
+            question,
+            top_k=self._settings.rag_top_k,
+            network_online=network_online,
+            allow_rerank=network_online and self._settings.qwen_enable_rerank,
+        )
+        return {"knowledge_hits": hits}
+
+    def _prompt_node(self, state: AgentState) -> AgentState:
+        role = state.get("role", UserRole.FAMILY)
+        question = str(state.get("question", ""))
+        samples = list(state.get("samples", []))
+        health_context = self._build_health_context(samples)
+        knowledge_context = "\n\n".join(state.get("knowledge_hits", []))
+        prompt = build_prompt(role, question, health_context, knowledge_context)
+        return {
+            "health_context": health_context,
+            "prompt": prompt,
+        }
+
+    def _llm_node(self, state: AgentState) -> AgentState:
+        prompt = str(state.get("prompt", "")).strip()
+        selected_mode = str(state.get("selected_mode", "local"))
+        if not prompt:
+            return {"answer": "", "selected_mode": selected_mode}
+
+        if selected_mode == "cloud":
+            answer = self._invoke_cloud(prompt)
+            if answer:
+                return {"answer": answer, "selected_mode": "cloud"}
+            local_answer = self._invoke_local(prompt)
+            return {"answer": local_answer or "", "selected_mode": "local"}
+
+        answer = self._invoke_local(prompt)
+        if answer:
+            return {"answer": answer, "selected_mode": "local"}
+
+        cloud_answer = self._invoke_cloud(prompt)
+        if cloud_answer:
+            return {"answer": cloud_answer, "selected_mode": "cloud"}
+
+        return {"answer": "", "selected_mode": "local"}
 
     @staticmethod
     def _build_health_context(samples: list[HealthSample]) -> str:
@@ -64,7 +197,98 @@ class HealthAgentService:
             f"SOS 状态：{'是' if latest.sos_flag else '否'}"
         )
 
-    def _call_ollama(self, prompt: str) -> str | None:
+    def _network_available(self) -> bool:
+        ttl = max(5, self._settings.network_probe_cache_seconds)
+        now = time.monotonic()
+        if now - self._network_cache_at < ttl:
+            return self._network_cache_value
+
+        probe_url = self._settings.network_probe_url.strip() or self._settings.qwen_api_base
+        req = request.Request(url=probe_url, method="HEAD")
+        try:
+            with request.urlopen(req, timeout=self._settings.network_probe_timeout_seconds) as response:
+                status = int(getattr(response, "status", 200))
+                online = status < 500
+        except error.HTTPError as exc:
+            online = exc.code < 500
+        except (error.URLError, TimeoutError):
+            online = False
+
+        self._network_cache_at = now
+        self._network_cache_value = online
+        return online
+
+    def _invoke_local(self, prompt: str) -> str | None:
+        if ChatOllama is not None and HumanMessage is not None:
+            if self._local_llm is None:
+                self._local_llm = self._build_local_llm()
+            if self._local_llm is not None:
+                try:
+                    response = self._local_llm.invoke([HumanMessage(content=prompt)])
+                    answer = self._extract_message_text(response)
+                    if answer:
+                        return answer
+                except Exception:
+                    pass
+        return self._call_ollama_http(prompt)
+
+    def _invoke_cloud(self, prompt: str) -> str | None:
+        if not self._settings.qwen_api_key:
+            return None
+
+        if ChatOpenAI is not None and HumanMessage is not None:
+            if self._cloud_llm is None:
+                self._cloud_llm = self._build_cloud_llm()
+            if self._cloud_llm is not None:
+                try:
+                    response = self._cloud_llm.invoke([HumanMessage(content=prompt)])
+                    answer = self._extract_message_text(response)
+                    if answer:
+                        return answer
+                except Exception:
+                    pass
+
+        return self._call_qwen_http(prompt)
+
+    def _build_local_llm(self):
+        try:
+            return ChatOllama(
+                model=self._settings.ollama_model,
+                base_url=self._settings.ollama_base_url,
+                temperature=0.2,
+            )
+        except TypeError:
+            return ChatOllama(model=self._settings.ollama_model, temperature=0.2)
+        except Exception:
+            return None
+
+    def _build_cloud_llm(self):
+        if ChatOpenAI is None:
+            return None
+
+        try:
+            return ChatOpenAI(
+                model_name=self._settings.qwen_model,
+                openai_api_base=self._settings.qwen_api_base,
+                openai_api_key=self._settings.qwen_api_key,
+                temperature=0.3,
+                request_timeout=self._settings.llm_timeout_seconds,
+            )
+        except TypeError:
+            try:
+                return ChatOpenAI(
+                    model=self._settings.qwen_model,
+                    base_url=self._settings.qwen_api_base,
+                    api_key=self._settings.qwen_api_key,
+                    temperature=0.3,
+                    timeout=self._settings.llm_timeout_seconds,
+                )
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def _call_ollama_http(self, prompt: str) -> str | None:
         url = f"{self._settings.ollama_base_url}/api/chat"
         payload = json.dumps(
             {
@@ -74,12 +298,15 @@ class HealthAgentService:
             }
         ).encode("utf-8")
         headers = {"Content-Type": "application/json"}
-        return self._post_json(url, payload, headers, parser=lambda body: body.get("message", {}).get("content"))
+        return self._post_json(
+            url,
+            payload,
+            headers,
+            parser=lambda body: body.get("message", {}).get("content"),
+        )
 
-    def _call_qwen(self, prompt: str) -> str | None:
-        if not self._settings.qwen_api_key:
-            return None
-        url = f"{self._settings.qwen_api_base}/chat/completions"
+    def _call_qwen_http(self, prompt: str) -> str | None:
+        url = f"{self._settings.qwen_api_base.rstrip('/')}/chat/completions"
         payload = json.dumps(
             {
                 "model": self._settings.qwen_model,
@@ -103,9 +330,30 @@ class HealthAgentService:
         try:
             with request.urlopen(req, timeout=self._settings.llm_timeout_seconds) as response:
                 body = json.loads(response.read().decode("utf-8"))
-                return parser(body)
+                parsed = parser(body)
+                return str(parsed).strip() if parsed else None
         except (error.URLError, error.HTTPError, TimeoutError, json.JSONDecodeError):
             return None
+
+    @staticmethod
+    def _extract_message_text(message: Any) -> str | None:
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            value = content.strip()
+            return value or None
+        if isinstance(content, list):
+            parts: list[str] = []
+            for row in content:
+                if isinstance(row, str):
+                    if row.strip():
+                        parts.append(row.strip())
+                elif isinstance(row, dict):
+                    text = row.get("text") or row.get("content")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text.strip())
+            if parts:
+                return "\n".join(parts)
+        return None
 
     @staticmethod
     def _fallback_answer(samples: list[HealthSample], role: UserRole) -> str:

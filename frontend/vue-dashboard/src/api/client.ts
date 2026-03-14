@@ -10,9 +10,9 @@ export interface HealthSample {
   heart_rate: number;
   temperature: number;
   blood_oxygen: number;
-  blood_pressure: string;
-  battery: number;
-  sos_flag: boolean;
+  blood_pressure?: string;
+  battery?: number;
+  sos_flag?: boolean;
   health_score?: number | null;
 }
 
@@ -24,6 +24,21 @@ export interface AlarmRecord {
   message: string;
   acknowledged: boolean;
   created_at: string;
+}
+
+export interface AgentResponse {
+  scope: string;
+  mode: string;
+  network_online: boolean;
+  answer: string;
+  references: string[];
+  analysis?: Record<string, unknown>;
+}
+
+export interface CommunityOverview {
+  clusters: Record<string, string[]>;
+  device_count: number;
+  intelligent_anomaly_score: number;
 }
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000/api/v1";
@@ -40,11 +55,35 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
 export const api = {
   listDevices: () => requestJson<DeviceRecord[]>(`${API_BASE}/devices`),
   getRealtime: (mac: string) => requestJson<HealthSample>(`${API_BASE}/health/realtime/${mac}`),
-  getTrend: (mac: string) => requestJson<HealthSample[]>(`${API_BASE}/health/trend/${mac}?minutes=180&limit=120`),
+  getTrend: (mac: string, minutes = 180, limit = 120) =>
+    requestJson<HealthSample[]>(`${API_BASE}/health/trend/${mac}?minutes=${minutes}&limit=${limit}`),
+  getCommunityOverview: () =>
+    requestJson<CommunityOverview>(`${API_BASE}/health/community/overview`),
   listAlarms: () => requestJson<AlarmRecord[]>(`${API_BASE}/alarms?active_only=true`),
-  ackAlarm: (alarmId: string) => requestJson<AlarmRecord>(`${API_BASE}/alarms/${alarmId}/acknowledge`, { method: "POST" }),
-  analyze: (payload: { device_mac: string; question: string; role: string; mode: string }) =>
-    requestJson<{ answer: string; references: string[] }>(`${API_BASE}/chat/analyze`, {
+  ackAlarm: (alarmId: string) =>
+    requestJson<AlarmRecord>(`${API_BASE}/alarms/${alarmId}/acknowledge`, { method: "POST" }),
+  analyze: (payload: {
+    device_mac: string;
+    question: string;
+    role: string;
+    mode: string;
+    history_limit?: number;
+    history_minutes?: number;
+  }) =>
+    requestJson<AgentResponse>(`${API_BASE}/chat/analyze`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  analyzeCommunity: (payload: {
+    question: string;
+    role: string;
+    mode: string;
+    history_minutes?: number;
+    per_device_limit?: number;
+    device_macs?: string[];
+  }) =>
+    requestJson<AgentResponse>(`${API_BASE}/chat/analyze/community`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),

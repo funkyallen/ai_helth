@@ -1,6 +1,48 @@
-﻿# AIoT 智慧康养健康监测系统
+# AIoT 智慧康养健康监测系统
 
 基于比赛规程、T10 手环协议和 `ai_health_iot_full_prompt.md` 生成的全栈演示项目，覆盖后端 API、IoT 解析、异常检测、AI 助手、Vue 大屏和 Flutter 移动端骨架。
+
+## 当前推荐启动方式（helth）
+
+当前工作目录在 OneDrive 中，推荐直接复用现有 conda 环境 `helth`，并默认关闭后端热重载，减少文件监听带来的卡顿和误触发。
+
+### 1. 安装依赖
+
+```powershell
+conda activate helth
+python -m pip install -r requirements.txt
+```
+
+如果你只想快速完成本地启动和测试，也可以先安装当前仓库提供的精简运行依赖：
+
+```powershell
+conda activate helth
+python -m pip install -r requirements-runtime.txt
+```
+
+### 2. 启动后端
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start_server.ps1 -CondaEnv helth
+```
+
+### 3. 启动前端
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start_frontend.ps1
+```
+
+### 4. 运行测试与冒烟验证
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_smoke_tests.ps1 -CondaEnv helth -BuildFrontend
+```
+
+如果你只想确认后端是否能真正启动并返回接口数据，可以执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\smoke_backend_http.ps1 -CondaEnv helth
+```
 
 ## 项目结构
 
@@ -65,7 +107,7 @@ D:\conda-envs\ai-health-iot
 
 ### 2. 推荐方式：使用一键脚本安装
 
-项目已经提供了环境安装脚本 [scripts/setup_env.ps1](D:/OneDrive/文档/1-课程资料/4- 人工智能+/2026/演示项目/scripts/setup_env.ps1)。
+项目已经提供了环境安装脚本 `scripts/setup_env.ps1`。
 
 它会自动做这些事情：
 
@@ -182,7 +224,51 @@ conda activate D:\conda-envs\ai-health-iot
 
 ## 项目启动流程
 
-### 1. 启动后端
+下面这套流程适合当前仓库的本地演示和答辩场景。
+
+### 0. 初始化配置
+
+先在项目根目录准备本地配置文件：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+如果你要使用云端 Qwen，请至少补齐：
+
+- `QWEN_API_KEY`
+- `QWEN_MODEL`
+- `QWEN_EMBEDDING_MODEL`
+- `QWEN_RERANK_MODEL`
+
+如果你只打算离线演示，可以保留默认值，但要确保本机 Ollama 已启动，且已经拉取：
+
+```powershell
+ollama pull qwen3:1.7b
+```
+
+### 1. 安装 Python 依赖
+
+如果你已经通过 `scripts/setup_env.ps1` 创建好了 conda 环境，只需要激活环境即可；如果没有，也可以直接安装：
+
+```powershell
+conda activate D:\conda-envs\ai-health-iot
+python -m pip install -r requirements.txt
+```
+
+### 2. 启动基础依赖服务
+
+推荐先启动 PostgreSQL / Redis / ChromaDB / Ollama：
+
+```powershell
+cd docker
+docker compose up -d postgres redis chromadb ollama
+cd ..
+```
+
+如果你只是快速体验，也可以不启动 PostgreSQL，保持默认的 SQLite 模式运行；但社区演示和后续扩展更推荐把依赖服务都拉起来。
+
+### 3. 启动后端
 
 ```powershell
 conda activate D:\conda-envs\ai-health-iot
@@ -191,35 +277,66 @@ python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
 
 默认开启 `USE_MOCK_DATA=true`，后端会持续生成 10 台 T10 设备的模拟数据，方便现场直接演示。
 
-### 2. 启动前端
+后端启动后，可以先检查：
+
+```powershell
+curl http://127.0.0.1:8000/healthz
+```
+
+### 4. 启动前端
+
+前端目录位于 `frontend/vue-dashboard`，首次启动前先安装依赖：
 
 ```powershell
 cd frontend\vue-dashboard
-npm install
-npm run dev
-```
-
-如果 PowerShell 报 `npm.ps1` 执行策略错误，可改用：
-
-```powershell
 npm.cmd install
 npm.cmd run dev
 ```
 
-### 3. 启动 Docker 依赖
+如果你的 PowerShell 已经允许直接运行 npm，也可以使用：
 
 ```powershell
-cd docker
-docker compose up -d
+npm install
+npm run dev
 ```
 
-### 4. 启动 Flutter 客户端
+默认访问地址通常为：
+
+- `http://127.0.0.1:5173`
+- `http://localhost:5173`
+
+前端默认会请求 `http://localhost:8000/api/v1`，如果你的后端地址不同，可以通过 `VITE_API_BASE` 和 `VITE_WS_BASE` 覆盖。
+
+### 5. 前端构建验证
+
+开发调试完成后，建议执行一次生产构建：
+
+```powershell
+cd frontend\vue-dashboard
+npm.cmd run build
+```
+
+构建产物会输出到：
+
+```text
+frontend/vue-dashboard/dist
+```
+
+### 6. 启动 Flutter 客户端
+
+如果要联动移动端骨架，再执行：
 
 ```powershell
 cd mobile\flutter_app
 flutter pub get
 flutter run
 ```
+
+### 7. 在线 / 离线模型切换说明
+
+- 有外网时：LangChain + LangGraph 智能体优先走阿里云百炼 Qwen API，并使用百炼向量模型和重排序模型。
+- 无外网时：自动回退到本地 `Ollama + qwen3:1.7b`，RAG 保留 Chroma 检索，不启用重排序。
+- 社区汇总分析与单设备趋势分析都共用这一套自动路由逻辑。
 
 ## API 亮点
 
@@ -291,3 +408,20 @@ nvidia-smi
 - 若现场允许 GPU，继续训练 `ai/anomaly_detector.py` 中的时间序列自编码器。
 - 若需要答辩加分，可把 `community/overview` 扩成社区热力图和风险地图。
 - 若接入真实网关，优先启用 `iot/mqtt_listener.py` 或 `iot/serial_reader.py`。
+
+
+## 构建环境
+
+```powershell
+conda create -n ai-health-iot python=3.11 -y
+conda activate ai-health-iot
+python -m pip install -r requirements.txt
+```
+
+当前仓库中的智能体链路已经按以下方式组织：
+
+- `langchain==1.2.0`
+- `langgraph>=1.0,<2.0`
+- 有外网时优先使用 Qwen API
+- 无外网时回退到 `Ollama + qwen3:1.7b`
+- RAG 使用 ChromaDB，在线时启用词嵌入和重排序，离线时关闭重排序

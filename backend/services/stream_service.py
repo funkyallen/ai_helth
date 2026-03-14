@@ -25,8 +25,40 @@ class StreamService:
         return stream[-1]
 
     def recent(self, device_mac: str, limit: int = 60) -> list[HealthSample]:
-        stream = self._streams.get(device_mac.upper(), deque())
-        return list(stream)[-limit:]
+        return self.recent_in_window(device_mac, minutes=None, limit=limit)
+
+    def recent_in_window(
+        self,
+        device_mac: str,
+        *,
+        minutes: int | None = None,
+        limit: int = 60,
+    ) -> list[HealthSample]:
+        values = list(self._streams.get(device_mac.upper(), deque()))
+        if minutes is not None:
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+            values = [sample for sample in values if sample.timestamp >= cutoff]
+        return values[-limit:]
+
+    def recent_by_devices(
+        self,
+        device_macs: list[str] | None = None,
+        *,
+        minutes: int = 1440,
+        per_device_limit: int = 288,
+    ) -> dict[str, list[HealthSample]]:
+        selected_macs = [mac.upper() for mac in device_macs] if device_macs else sorted(self._streams.keys())
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+        snapshots: dict[str, list[HealthSample]] = {}
+        for mac in selected_macs:
+            values = [
+                sample
+                for sample in self._streams.get(mac, deque())
+                if sample.timestamp >= cutoff
+            ]
+            if values:
+                snapshots[mac] = values[-per_device_limit:]
+        return snapshots
 
     def trend(
         self,
@@ -35,9 +67,8 @@ class StreamService:
         minutes: int = 60,
         limit: int = 120,
     ) -> list[HealthTrendPoint]:
-        now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(minutes=minutes)
-        values = [
+        values = self.recent_in_window(device_mac, minutes=minutes, limit=limit)
+        return [
             HealthTrendPoint(
                 timestamp=sample.timestamp,
                 heart_rate=sample.heart_rate,
@@ -45,10 +76,8 @@ class StreamService:
                 blood_oxygen=sample.blood_oxygen,
                 health_score=sample.health_score,
             )
-            for sample in self._streams.get(device_mac.upper(), deque())
-            if sample.timestamp >= cutoff
+            for sample in values
         ]
-        return values[-limit:]
 
     def latest_samples(self) -> list[HealthSample]:
         snapshots: list[HealthSample] = []

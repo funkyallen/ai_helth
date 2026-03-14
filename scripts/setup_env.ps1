@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$EnvPath = 'D:\conda-envs\ai-health-iot',
     [string]$ProxyUrl = '',
     [switch]$SkipConnectivityCheck,
@@ -18,7 +18,20 @@ function Invoke-Conda {
     )
 
     $env:CONDA_NO_PLUGINS = 'true'
-    & conda @Args
+
+    $condaPath = (Get-Command conda.exe -ErrorAction SilentlyContinue).Source
+    if (-not $condaPath) {
+        $condaPath = (Get-Command conda.bat -ErrorAction SilentlyContinue).Source
+    }
+    if (-not $condaPath) {
+        $condaPath = (Get-Command conda -ErrorAction SilentlyContinue).Source
+    }
+
+    if (-not $condaPath) {
+        throw 'Unable to locate conda executable; ensure conda is installed and on PATH.'
+    }
+
+    & $condaPath @Args
     if ($LASTEXITCODE -ne 0) {
         throw "Conda command failed: conda $($Args -join ' ')"
     }
@@ -30,7 +43,19 @@ function Invoke-CondaRunPython {
         [string[]]$Args
     )
 
-    & conda run -p $EnvPath python @Args
+    $condaPath = (Get-Command conda.exe -ErrorAction SilentlyContinue).Source
+    if (-not $condaPath) {
+        $condaPath = (Get-Command conda.bat -ErrorAction SilentlyContinue).Source
+    }
+    if (-not $condaPath) {
+        $condaPath = (Get-Command conda -ErrorAction SilentlyContinue).Source
+    }
+
+    if (-not $condaPath) {
+        throw 'Unable to locate conda executable; ensure conda is installed and on PATH.'
+    }
+
+    & $condaPath run -p $EnvPath python @Args
     if ($LASTEXITCODE -ne 0) {
         throw "Conda run python failed: python $($Args -join ' ')"
     }
@@ -70,17 +95,17 @@ if (Test-Path $EnvPath) {
 
 if ($UseYamlInstall) {
     Write-Step 'Creating environment from YAML'
-    Invoke-Conda env create --solver classic -p $EnvPath -f environment/conda-environment.yml
+    Invoke-Conda -- env create --solver classic -p $EnvPath -f environment/conda-environment.yml
 }
 else {
     Write-Step 'Creating base environment'
-    Invoke-Conda create --solver classic -p $EnvPath python=3.9 pip nodejs=20 -y
+    Invoke-Conda -- create --solver classic -p $EnvPath python=3.9 pip nodejs=20 -y
 
     Write-Step 'Installing CUDA-enabled PyTorch stack'
-    Invoke-Conda install --solver classic -p $EnvPath pytorch=2.0.1 torchvision=0.15.2 torchaudio=2.0.2 pytorch-cuda=11.7 -c pytorch -c nvidia -y
+    Invoke-Conda -- install --solver classic -p $EnvPath pytorch=2.0.1 torchvision=0.15.2 torchaudio=2.0.2 pytorch-cuda=11.7 -c pytorch -c nvidia -y
 
     Write-Step 'Installing core scientific and backend packages'
-    Invoke-Conda install --solver classic -p $EnvPath `
+    Invoke-Conda -- install --solver classic -p $EnvPath `
         numpy=1.24.4 pandas=2.0.3 scipy=1.10.1 scikit-learn=1.0.2 `
         matplotlib=3.7.5 seaborn=0.13.2 pyyaml=6.0.2 lxml=4.9.3 pillow=10.4.0 `
         requests=2.32.3 beautifulsoup4=4.12.3 pyparsing=3.1.4 certifi=2025.1.31 `
@@ -91,14 +116,21 @@ else {
     Write-Step 'Installing pip-only packages'
     Invoke-CondaRunPython -m pip install --upgrade pip
     Invoke-CondaRunPython -m pip install `
+        'httpx>=0.27,<1' `
         'chromadb==0.5.23' `
-        'pydantic-settings==2.8.1' `
+        'pydantic-settings>=2.10.1,<3' `
         'bleak>=0.22,<0.24' `
         'paho-mqtt>=2.1,<3' `
         'pyserial>=3.5,<4' `
         'ollama>=0.4.5,<1' `
-        'langchain>=0.3.14,<0.4' `
-        'langgraph>=0.2.61,<0.3'
+        'langchain==1.2.0' `
+        'langchain-core>=1.0,<2.0' `
+        'langchain-community>=0.4,<0.5' `
+        'langgraph>=1.0,<2.0' `
+        'langchain-openai>=1.0,<2.0' `
+        'langchain-ollama>=1.0,<2.0' `
+        'langchain-qwq>=0.3.4,<1' `
+        'openai>=1.30,<2'
 }
 
 Write-Step 'Verifying torch CUDA availability'
